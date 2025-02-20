@@ -8,7 +8,7 @@ readme = "README.md"
 repository = "https://github.com/mei28/sgh"
 homepage = "https://github.com/mei28/sgh"
 keywords = ["ssh", "tui" ,"cli"]
-categories = ["cli", "tui" ]
+categories = ["command-line-utilities", "development-tools"]
 
 
 [dependencies]

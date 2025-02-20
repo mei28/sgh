@@ -13,7 +13,7 @@ use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use ratatui::{prelude::*, widgets::*};
 use std::{
     cell::RefCell,
-    cmp::{max, min},
+    cmp::min,
     io,
     rc::Rc,
 };
