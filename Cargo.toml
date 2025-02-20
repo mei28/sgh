@@ -2,6 +2,14 @@
 name = "sgh"
 version = "0.1.0"
 edition = "2021"
+description = "A TUI tool for ssh"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/mei28/sgh"
+homepage = "https://github.com/mei28/sgh"
+keywords = ["ssh", "tui" ,"cli"]
+categories = ["cli", "tui" ]
+
 
 [dependencies]
 anyhow = "1.0.95"
