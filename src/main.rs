@@ -1,6 +1,7 @@
 pub mod searchable;
 pub mod ssh;
 pub mod ssh_config;
+pub mod theme;
 pub mod ui;
 
 use anyhow::Result;
@@ -10,13 +11,16 @@ use ui::{App, AppConfig};
 #[derive(Parser, Debug)]
 #[command(version, about, long_about=None)]
 struct Args {
-    #[arg(
-        short,
-        long,
-        num_args = 1.., 
-        default_values = ["/etc/ssh/ssh_config", "~/.ssh/config"]
-    )]
-    config: Vec<String>,
+    /// SSH configuration files to load. When omitted, sgh reads the standard
+    /// locations (`/etc/ssh/ssh_config`, `~/.ssh/config`) and, unless
+    /// `--no-config-d` is set, every regular file under `~/.ssh/config.d/`.
+    #[arg(short, long, num_args = 1..)]
+    config: Option<Vec<String>>,
+
+    /// Disable the automatic discovery of `~/.ssh/config.d/*` when `--config`
+    /// is not provided.
+    #[arg(long, default_value_t = false)]
+    no_config_d: bool,
 
     // show the proxy command
     #[arg(long, default_value_t = false)]
@@ -50,8 +54,23 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    let (config_paths, strict_missing) = match args.config {
+        Some(paths) => (paths, true),
+        None => {
+            let mut defaults = vec![
+                "/etc/ssh/ssh_config".to_string(),
+                "~/.ssh/config".to_string(),
+            ];
+            if !args.no_config_d {
+                defaults.push("~/.ssh/config.d/*".to_string());
+            }
+            (defaults, false)
+        }
+    };
+
     let mut app = App::new(&AppConfig {
-        config_paths: args.config,
+        config_paths,
+        strict_missing,
         search_filter: args.search,
         sort_by_name: args.sort,
         show_proxy_command: args.show_proxy_command,

@@ -48,6 +48,11 @@ where
     }
 
     #[allow(clippy::must_use_candidate)]
+    pub fn total_len(&self) -> usize {
+        self.vec.len()
+    }
+
+    #[allow(clippy::must_use_candidate)]
     pub fn is_empty(&self) -> bool {
         self.filtered.is_empty()
     }

@@ -21,13 +21,20 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 use unicode_width::UnicodeWidthStr;
 
-use crate::{searchable::Searchable, ssh};
+use crate::{searchable::Searchable, ssh, theme::Theme};
 
-const INFO_TEXT: &str = "(Esc) quit | (↑) move up | (↓) move down | (enter) select";
+const PROMPT: &str = "❯ ";
+const SELECTION_MARKER: &str = "▌ ";
+const SELECTION_PADDING: &str = "  ";
 
 #[derive(Clone)]
 pub struct AppConfig {
     pub config_paths: Vec<String>,
+
+    /// When true, every entry in `config_paths` must resolve to a readable
+    /// file (user supplied `--config` explicitly). When false, missing files
+    /// are silently ignored (auto-discovered defaults).
+    pub strict_missing: bool,
 
     pub search_filter: Option<String>,
     pub sort_by_name: bool,
@@ -41,6 +48,8 @@ pub struct AppConfig {
 
 pub struct App {
     config: AppConfig,
+    theme: Theme,
+    matcher: SkimMatcherV2,
 
     search: Input,
 
@@ -63,20 +72,30 @@ impl App {
     pub fn new(config: &AppConfig) -> Result<App> {
         let mut hosts = Vec::new();
 
-        for path in &config.config_paths {
+        let expanded = ssh::expand_config_paths(&config.config_paths);
+        for path in &expanded {
             let parsed_hosts = match ssh::parse_config(path) {
                 Ok(h) => h,
                 Err(err) => {
-                    if path == "/etc/ssh/ssh_config" {
-                        if let ssh::ParseConfigError::Io(io_err) = &err {
-                            // Ignore missing system-wide SSH configuration file
-                            if io_err.kind() == std::io::ErrorKind::NotFound {
-                                continue;
-                            }
-                        }
+                    // Missing files are tolerated for auto-discovered defaults.
+                    // The system-wide config is always optional, even under
+                    // strict mode, to preserve existing behaviour.
+                    let is_missing = matches!(
+                        &err,
+                        ssh::ParseConfigError::Io(io_err)
+                            if io_err.kind() == std::io::ErrorKind::NotFound
+                    );
+                    let is_system_default =
+                        path.as_os_str() == std::ffi::OsStr::new("/etc/ssh/ssh_config");
+
+                    if is_missing && (!config.strict_missing || is_system_default) {
+                        continue;
                     }
 
-                    anyhow::bail!("Failed to parse SSH configuration file: {err:?}");
+                    anyhow::bail!(
+                        "Failed to parse SSH configuration file {}: {err:?}",
+                        path.display()
+                    );
                 }
             };
 
@@ -95,6 +114,8 @@ impl App {
         // Searchable に格納
         let mut app = App {
             config: config.clone(),
+            theme: Theme::dark(),
+            matcher: SkimMatcherV2::default(),
 
             search: search_input.clone().into(),
 
@@ -367,7 +388,9 @@ impl App {
         }
 
         let mut new_constraints = vec![
-            // +1 for padding
+            // Marker column (▌ / spaces) — width matches SELECTION_MARKER.
+            Constraint::Length(u16::try_from(UnicodeWidthStr::width(SELECTION_MARKER)).unwrap_or(2)),
+            // Name column (+1 for breathing room).
             Constraint::Length(u16::try_from(lengths[0]).unwrap_or_default() + 1),
         ];
         new_constraints.extend(
@@ -420,121 +443,302 @@ where
 
 /// メインの描画関数
 fn ui(f: &mut Frame, app: &mut App) {
-    // (上)検索バー, (中段上)テーブル, (中段下)ローカルフォワード, (下)フッター という4分割
     let layout_main = Layout::vertical([
-        Constraint::Length(3),  // search bar
-        Constraint::Length(10), // table
-        Constraint::Min(3),     // local forward panel
-        Constraint::Length(3),  // footer
+        Constraint::Length(3),  // search bar (single line + borders)
+        Constraint::Min(6),     // host table (fills available space)
+        Constraint::Length(8),  // detail panel
+        Constraint::Length(1),  // footer (single-line, no border)
     ])
     .split(f.area());
 
     render_searchbar(f, app, layout_main[0]);
     render_table(f, app, layout_main[1]);
-    render_local_forwards_panel(f, app, layout_main[2]);
+    render_detail_panel(f, app, layout_main[2]);
     render_footer(f, app, layout_main[3]);
 
-    // 検索バーにカーソル表示
+    // Place cursor inside the search bar (1 line border + PROMPT width).
+    let prompt_width = u16::try_from(UnicodeWidthStr::width(PROMPT)).unwrap_or(2);
     let mut cursor_position = layout_main[0].as_position();
-    cursor_position.x += u16::try_from(app.search.cursor()).unwrap_or_default() + 4;
+    cursor_position.x += u16::try_from(app.search.cursor()).unwrap_or_default() + prompt_width + 1;
     cursor_position.y += 1;
     f.set_cursor_position(cursor_position);
 }
 
 fn render_searchbar(f: &mut Frame, app: &mut App, area: Rect) {
-    let info_footer = Paragraph::new(Line::from(app.search.value())).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .padding(Padding::horizontal(3))
-            .title("Search"),
-    );
-    f.render_widget(info_footer, area);
+    let theme = &app.theme;
+    let prompt = Span::styled(PROMPT, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD));
+    let query = Span::styled(app.search.value(), Style::default().fg(theme.text));
+    let content = Line::from(vec![prompt, query]);
+
+    let matched = app.hosts.len();
+    let total = app.hosts.total_len();
+    let count = format!(" {matched} / {total} ");
+    let title_right = Line::from(Span::styled(
+        count,
+        Style::default().fg(theme.muted),
+    ))
+    .right_aligned();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border_focused))
+        .title(Line::from(Span::styled(
+            " Search ",
+            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+        )))
+        .title(title_right);
+
+    let paragraph = Paragraph::new(content).block(block);
+    f.render_widget(paragraph, area);
 }
 
 fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
-    let header_style = Style::default().fg(Color::Cyan);
-    let selected_style = Style::default().add_modifier(Modifier::REVERSED);
+    let theme = &app.theme;
+    let query = app.search.value().to_string();
 
-    let mut header_names = vec!["Name", "Aliases", "User", "Destination", "Port"];
-    if app.config.show_proxy_command {
-        header_names.push("Proxy");
-    }
+    // First column is the marker, then the existing data columns.
+    let mut header_cells: Vec<Cell> = vec![Cell::from("")];
+    let data_headers = if app.config.show_proxy_command {
+        vec!["NAME", "ALIASES", "USER", "DESTINATION", "PORT", "PROXY"]
+    } else {
+        vec!["NAME", "ALIASES", "USER", "DESTINATION", "PORT"]
+    };
+    header_cells.extend(
+        data_headers
+            .iter()
+            .map(|h| Cell::from(Span::styled(*h, theme.header_style()))),
+    );
 
-    let header = Row::new(header_names.iter().map(|h| Cell::from(*h)))
-        .style(header_style)
-        .height(1);
+    let header = Row::new(header_cells).height(1).bottom_margin(1);
+    let selected_idx = app.table_state.selected().unwrap_or(usize::MAX);
 
-    let rows = app.hosts.iter().map(|host| {
-        let mut content = vec![
-            host.name.clone(),
-            host.aliases.clone(),
-            host.user.clone().unwrap_or_default(),
-            host.destination.clone(),
-            host.port.clone().unwrap_or_default(),
-        ];
-        if app.config.show_proxy_command {
-            content.push(host.proxy_command.clone().unwrap_or_default());
-        }
+    let rows = app
+        .hosts
+        .iter()
+        .enumerate()
+        .map(|(idx, host)| build_row(idx, selected_idx, host, &query, &app.matcher, theme, app.config.show_proxy_command))
+        .collect::<Vec<_>>();
 
-        Row::new(content)
-    });
+    let block = Block::default()
+        .borders(Borders::NONE)
+        .padding(Padding::horizontal(1));
 
-    let t = Table::new(rows, &app.table_columns_constraints)
+    let table = Table::new(rows, &app.table_columns_constraints)
         .header(header)
-        .row_highlight_style(selected_style)
-        .block(Block::default().borders(Borders::ALL).title("Hosts"));
+        .row_highlight_style(theme.selection_style())
+        .column_spacing(2)
+        .block(block);
 
-    f.render_stateful_widget(t, area, &mut app.table_state);
+    f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
-/// LocalForward を複数行で描画
-fn render_local_forwards_panel(f: &mut Frame, app: &mut App, area: Rect) {
+fn build_row<'a>(
+    idx: usize,
+    selected_idx: usize,
+    host: &'a ssh::Host,
+    query: &str,
+    matcher: &SkimMatcherV2,
+    theme: &Theme,
+    show_proxy: bool,
+) -> Row<'a> {
+    let marker = if idx == selected_idx {
+        Cell::from(Span::styled(
+            SELECTION_MARKER,
+            Style::default()
+                .fg(theme.selection_marker)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Cell::from(SELECTION_PADDING)
+    };
+
+    let name_cell = highlighted_cell(&host.name, query, matcher, theme);
+    let aliases_cell = Cell::from(Span::styled(
+        host.aliases.clone(),
+        Style::default().fg(theme.text_dim),
+    ));
+    let user_cell = Cell::from(Span::styled(
+        host.user.clone().unwrap_or_default(),
+        Style::default().fg(theme.text_dim),
+    ));
+    let destination_cell = highlighted_cell(&host.destination, query, matcher, theme);
+    let port_cell = Cell::from(Span::styled(
+        host.port.clone().unwrap_or_default(),
+        Style::default().fg(theme.text_dim),
+    ));
+
+    let mut cells = vec![marker, name_cell, aliases_cell, user_cell, destination_cell, port_cell];
+    if show_proxy {
+        cells.push(Cell::from(Span::styled(
+            host.proxy_command.clone().unwrap_or_default(),
+            Style::default().fg(theme.text_dim),
+        )));
+    }
+
+    Row::new(cells)
+}
+
+fn highlighted_cell<'a>(
+    value: &'a str,
+    query: &str,
+    matcher: &SkimMatcherV2,
+    theme: &Theme,
+) -> Cell<'a> {
+    let base = Style::default().fg(theme.text);
+    if query.is_empty() {
+        return Cell::from(Span::styled(value.to_string(), base));
+    }
+
+    let Some((_, indices)) = matcher.fuzzy_indices(value, query) else {
+        return Cell::from(Span::styled(value.to_string(), base));
+    };
+
+    let highlight = theme.match_style();
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut buf_is_match: Option<bool> = None;
+
+    for (i, ch) in value.chars().enumerate() {
+        let is_match = indices.contains(&i);
+        match buf_is_match {
+            Some(prev) if prev == is_match => buf.push(ch),
+            Some(prev) => {
+                spans.push(Span::styled(
+                    std::mem::take(&mut buf),
+                    if prev { highlight } else { base },
+                ));
+                buf.push(ch);
+                buf_is_match = Some(is_match);
+            }
+            None => {
+                buf.push(ch);
+                buf_is_match = Some(is_match);
+            }
+        }
+    }
+
+    if let Some(prev) = buf_is_match {
+        spans.push(Span::styled(buf, if prev { highlight } else { base }));
+    }
+
+    Cell::from(Line::from(spans))
+}
+
+/// 詳細パネル: 選択中のホストの ProxyJump / ProxyCommand / IdentityFile /
+/// LocalForward を key:value 表示する。値が空の項目は省略する。
+fn render_detail_panel(f: &mut Frame, app: &mut App, area: Rect) {
+    let theme = &app.theme;
     let selected_index = app.table_state.selected().unwrap_or(0);
+
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(theme.border_style())
+        .title(Line::from(Span::styled(
+            " Host detail ",
+            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+        )))
+        .padding(Padding::horizontal(2));
+
     if app.hosts.is_empty() || selected_index >= app.hosts.len() {
-        let empty_par = Paragraph::new("No host selected").block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Local Forwards")
-                .border_type(BorderType::Rounded),
-        );
-        f.render_widget(empty_par, area);
+        let paragraph = Paragraph::new(Span::styled(
+            "No host selected",
+            Style::default().fg(theme.muted),
+        ))
+        .block(block);
+        f.render_widget(paragraph, area);
         return;
     }
 
     let host = &app.hosts[selected_index];
+    let mut lines: Vec<Line> = Vec::new();
 
-    // LocalForward を複数行テキストにする
-    let mut lines = vec![];
-    if host.local_forwards.is_empty() {
-        lines.push("No LocalForward defined".to_string());
-    } else {
-        for lf in &host.local_forwards {
-            let line = format!("{} -> {}:{}", lf.local_port, lf.remote_host, lf.remote_port);
-            lines.push(line);
+    let mut push_field = |label: &str, value: &str| {
+        if value.is_empty() {
+            return;
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{label:<14}"),
+                Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(value.to_string(), Style::default().fg(theme.text)),
+        ]));
+    };
+
+    push_field("Hostname", &host.destination);
+    if let Some(v) = host.user.as_deref() {
+        push_field("User", v);
+    }
+    if let Some(v) = host.port.as_deref() {
+        push_field("Port", v);
+    }
+    if let Some(v) = host.proxy_jump.as_deref() {
+        push_field("ProxyJump", v);
+    }
+    if let Some(v) = host.proxy_command.as_deref() {
+        push_field("ProxyCommand", v);
+    }
+    if let Some(v) = host.identity_file.as_deref() {
+        push_field("IdentityFile", v);
+    }
+
+    if !host.local_forwards.is_empty() {
+        let first = host.local_forwards.first().unwrap();
+        let formatted = format!("{} → {}:{}", first.local_port, first.remote_host, first.remote_port);
+        push_field("LocalForward", &formatted);
+        let indent = " ".repeat(14);
+        for lf in host.local_forwards.iter().skip(1) {
+            lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::styled(
+                    format!("{} → {}:{}", lf.local_port, lf.remote_host, lf.remote_port),
+                    Style::default().fg(theme.text),
+                ),
+            ]));
         }
     }
 
-    let lines = lines.into_iter().map(Line::from).collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no extra settings)",
+            Style::default().fg(theme.muted),
+        )));
+    }
 
-    let paragraph = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Local Forwards")
-            .border_type(BorderType::Rounded),
-    );
-
+    let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);
 }
 
-fn render_footer(f: &mut Frame, _app: &mut App, area: Rect) {
-    let info_footer = Paragraph::new(Line::from(INFO_TEXT))
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title("Help"),
-        );
-    f.render_widget(info_footer, area);
+fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
+    let theme = &app.theme;
+    let sep = Span::styled("  │  ", Style::default().fg(theme.border));
+
+    let chips = [
+        ("↑↓", "navigate"),
+        ("↵", "connect"),
+        ("⌫", "edit"),
+        ("esc", "quit"),
+    ];
+
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::raw(" "));
+    for (i, (key, label)) in chips.iter().enumerate() {
+        if i > 0 {
+            spans.push(sep.clone());
+        }
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            (*label).to_string(),
+            Style::default().fg(theme.muted),
+        ));
+    }
+
+    let paragraph = Paragraph::new(Line::from(spans));
+    f.render_widget(paragraph, area);
 }
