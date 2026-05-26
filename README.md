@@ -4,7 +4,7 @@
 
 ## Features ✨
 
-- **Multiple Config Files**: By default, it reads both `/etc/ssh/ssh_config` and `~/.ssh/config`, merging their contents seamlessly.
+- **Multiple Config Files**: By default, it reads `/etc/ssh/ssh_config`, `~/.ssh/config`, and every regular file under `~/.ssh/config.d/`, merging their contents seamlessly. Pass `--no-config-d` to skip the directory.
 - **Fuzzy Search**: Type in the search bar to quickly filter hosts by name, alias, or destination.
 - **SSH Command Templates**: Use Handlebars templates (e.g. `ssh "{{{name}}}"`) to define how you connect to a host.
 - **Session Hooks**: Optional `--on-session-start-template` and `--on-session-end-template` let you run extra commands before and after SSH.
@@ -48,7 +48,8 @@ sgh [OPTIONS]
 
 Key CLI Options:
 
-* -c, --config <PATH>...: Provide one or more custom SSH config files (defaults to /etc/ssh/ssh_config and ~/.ssh/config).
+* -c, --config <PATH>...: Provide one or more custom SSH config files. When omitted, sgh reads `/etc/ssh/ssh_config`, `~/.ssh/config`, and `~/.ssh/config.d/*`.
+* --no-config-d: Skip the automatic discovery of `~/.ssh/config.d/*` (only effective when `--config` is not supplied).
 * --show-proxy-command: Show ProxyCommand details in the UI table.
 * -s, --search <FILTER>: Start sgh with an initial search filter.
 * --sort: Sort hosts by name (--sort=false to disable).
